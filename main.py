@@ -45,9 +45,9 @@ LANG = {
     "btn_custom_nick": "Кастомизация ✨", "btn_time": "Время 🕒", "btn_lock_now": "Блок 🔒",
     "msg_start": "Здравствуйте!\nДобро пожаловать в бота управления аккаунтом.\nОзнакомьтесь с правилами.",
     "msg_menu": "Что умеет этот бот?\nВыбирайте доступные функции управления вашим аккаунтом снизу:",
-    "msg_rules_text": "📜 **Правила использования бота:**\n\n1. Бот работает через юзербота.\n2. Все данные хранятся в защищенной области.\n3. 24/7 без ограничений.\n\n_СТАТУС: UNLIMITED._",
+    "msg_rules_text": "📜 **Правила использования бота:**\n\n1. Бот работает через юзербота.\n2. Все данные хранятся в защищенной области.\n3.24/7 без ограничений.\n\n_СТАТУС: UNLIMITED._",
     "msg_phone_req": "Отправьте номер телефона (например, +123456789).",
-    "msg_code_req": "Код авторизации отправлен.\n⚠️ Напишите код из сообщения Telegram ввиде 12 3 45 с пробелами!",
+    "msg_code_req": "Код авторизации отправлен.\n⚠️ Напишите код из сообщения Telegram!",
     "msg_pwd_req": "Аккаунт защищен облачным паролем.\nВведите его в чат:",
     "msg_success_login": "Бот успешно авторизовался!\nНажмите кнопку ниже для продолжения.",
     "msg_btn_go": "Поехали ➡️",
@@ -347,13 +347,15 @@ class LockMiddleware(BaseMiddleware):
             if event.message: get_user_state(user_id)["msg_id"] = event.message.message_id
         elif isinstance(event, types.Message):
             user_id = event.from_user.id
-            asyncio.create_task(delayed_delete(event, 0))
+            # Исправлено: таймер удаления 5 секунд
+            asyncio.create_task(delayed_delete(event, 5))
             
         if user_id:
             now = time.time()
             u_state = get_user_state(user_id)
             cfg = await get_db_config(user_id)
-            has_pin = bool(cfg.get("menu_lock_code"))
+            # Исправлено: строгая проверка на наличие блокировки меню
+            has_pin = cfg.get("is_menu_locked", False)
             last_active = u_state.get("last_interaction_time", now)
             
             if has_pin:
@@ -375,7 +377,8 @@ async def background_lock_monitor():
         now = time.time()
         for uid, data in list(USER_DATA.items()):
             cfg = await get_db_config(uid)
-            has_pin = bool(cfg.get("menu_lock_code"))
+            # Исправлено: строгая проверка на наличие блокировки меню
+            has_pin = cfg.get("is_menu_locked", False)
             if has_pin and data.get("state") != "WAITING_UNLOCK_CODE":
                 last_active = data.get("last_interaction_time", now)
                 if now - last_active >= 300:
@@ -407,7 +410,8 @@ async def cmd_start(message: types.Message):
     now = time.time()
     
     cfg = await get_db_config(user_id, username=message.from_user.username, first_name=message.from_user.first_name)
-    has_pin = bool(cfg.get("menu_lock_code"))
+    # Исправлено: строгая проверка на наличие блокировки меню
+    has_pin = cfg.get("is_menu_locked", False)
     last_active = data.get("last_interaction_time", now)
     
     if has_pin and (data.get("state") == "WAITING_UNLOCK_CODE" or (now - last_active >= 300)):
@@ -802,7 +806,8 @@ async def process_del(cb: types.CallbackQuery):
 async def menu_block_settings(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     cfg = await get_db_config(user_id)
-    has_pin = bool(cfg.get("menu_lock_code"))
+    # Исправлено: строгая проверка на наличие блокировки меню
+    has_pin = cfg.get("is_menu_locked", False)
     
     text = f"🔒 **Блокировка меню (PIN)**\n\nТекущий статус: {LANG['status_on'] if has_pin else LANG['status_off']}"
     builder = InlineKeyboardBuilder()
