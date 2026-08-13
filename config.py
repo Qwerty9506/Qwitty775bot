@@ -9,8 +9,16 @@ API_HASH = os.getenv("API_HASH", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-bot = Bot(token=BOT_TOKEN)
-supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not BOT_TOKEN:
+    print("⚠️ ВНИМАНИЕ: Переменная BOT_TOKEN не установлена!")
+
+bot = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    print("⚠️ ВНИМАНИЕ: SUPABASE_URL или SUPABASE_KEY не заданы!")
+    supabase = None
 
 ADMIN_USERNAMES = ["Qwtyf05920Real", "VG9sdWJhZXYgTWl5aXJiZWso"]
 TEMP_ADMINS = set()
