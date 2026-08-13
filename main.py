@@ -68,7 +68,7 @@ async def background_lock_monitor():
 # Catch-all для мусора
 async def catch_all_messages(message: types.Message):
     from utils import delayed_delete
-    asyncio.create_task(delayed_delete(message, 0))
+    asyncio.create_task(delayed_delete(message, 5))
 
 # Web Server
 async def render_web_handler(request):
