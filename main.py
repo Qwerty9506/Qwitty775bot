@@ -44,7 +44,7 @@ LANG = {
     "btn_turn_on": "Активировать ▶️", "btn_turn_off": "Выключить ❌", "btn_tz_select": "Часовой пояс 🕒", 
     "btn_refresh": "Обновить 🔄", "btn_autoresp_setup": "Текст Приветствия 📝", "btn_block_menu": "Блокировать Меню 🔒",
     "btn_register": "Регистрироваться 📝", "status_on": "Включен 🟢", "status_off": "Выключен 🔴",
-    "btn_custom_nick": "Кастомизация ✨", "btn_time": "Время 🕒",
+    "btn_custom_nick": "Кастомизация ✨", "btn_time": "Время 🕒", "btn_lock_now": "Блок 🔒",
     "msg_start": "Здравствуйте!\nДобро пожаловать в бота управления аккаунтом.\nОзнакомьтесь с правилами.",
     "msg_menu": "Что умеет этот бот?\nВыбирайте доступные функции управления вашим аккаунтом снизу:",
     "msg_rules_text": "📜 **Правила использования бота:**\n\n1. Бот работает через юзербота.\n2. Все данные хранятся в защищенной области.\n3. Бот работает 24/7 без ограничений.\n\n_СТАТУС: UNLIMITED._",
@@ -234,7 +234,7 @@ def strip_time_nick(name):
 
 def apply_custom_nick(base_name, time_str, style_idx):
     bold = str.maketrans("0123456789", "𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗")
-    double = str.maketrans("0123456789", "𝟘𝟙𝟚𝟛𝟜𝟝𝟞𝟟𝟠𝟡")
+    double = str.maketrans("0123456789", "𝟘𝟙𝟚𝟛𝟜𝟝𝞮𝟟𝟠𝟡")
     sans = str.maketrans("0123456789", "𝟢𝟣𝟤𝟥𝟦𝟧𝟨𝟩𝟪𝟫")
     mono = str.maketrans("0123456789", "𝟶𝟷𝟸𝟹𝟺𝟻𝟼𝟽𝟾𝟿")
     
@@ -363,23 +363,21 @@ class LockMiddleware(BaseMiddleware):
             if event.message: get_user_state(user_id)["msg_id"] = event.message.message_id
         elif isinstance(event, types.Message):
             user_id = event.from_user.id
+            asyncio.create_task(delayed_delete(event, 5))
             
         if user_id:
             now = time.time()
             u_state = get_user_state(user_id)
-            locked = u_state.get("is_menu_locked", False)
+            cfg = await get_db_config(user_id)
+            has_pin = bool(cfg.get("menu_lock_code"))
             last_active = u_state.get("last_interaction_time", now)
             
-            if locked and (now - last_active > 300):
-                if u_state.get("state") != "WAITING_UNLOCK_CODE":
+            if has_pin:
+                if u_state.get("state") == "WAITING_UNLOCK_CODE" or (now - last_active >= 300):
                     u_state["state"] = "WAITING_UNLOCK_CODE"
-                    try:
-                        if isinstance(event, types.CallbackQuery) and event.message:
-                            await event.message.delete()
-                    except: pass
-                    msg = await bot.send_message(user_id, LANG["msg_unlock_req"])
-                    u_state["msg_id"] = msg.message_id
-                    return
+                    if isinstance(event, types.CallbackQuery):
+                        await edit_or_send(user_id, LANG["msg_unlock_req"])
+                        return
             
             await update_db_config(user_id, {"last_interaction_time": now})
             
@@ -392,17 +390,16 @@ async def background_lock_monitor():
         await asyncio.sleep(10)
         now = time.time()
         for uid, data in list(USER_DATA.items()):
-            if data.get("is_menu_locked") and data.get("state") != "WAITING_UNLOCK_CODE":
+            cfg = await get_db_config(uid)
+            has_pin = bool(cfg.get("menu_lock_code"))
+            if has_pin and data.get("state") != "WAITING_UNLOCK_CODE":
                 last_active = data.get("last_interaction_time", now)
-                if now - last_active > 300:
+                if now - last_active >= 300:
                     data["state"] = "WAITING_UNLOCK_CODE"
                     try:
-                        if data.get("msg_id"):
-                            await bot.edit_message_text(LANG["msg_unlock_req"], chat_id=uid, message_id=data["msg_id"])
-                        else:
-                            msg = await bot.send_message(uid, LANG["msg_unlock_req"])
-                            data["msg_id"] = msg.message_id
-                    except Exception: pass
+                        await edit_or_send(uid, LANG["msg_unlock_req"])
+                    except Exception:
+                        pass
 
 async def edit_or_send(user_id, text, reply_markup=None, parse_mode=None):
     data = get_user_state(user_id)
@@ -412,8 +409,9 @@ async def edit_or_send(user_id, text, reply_markup=None, parse_mode=None):
             return
         except TelegramBadRequest as e:
             if "not modified" in str(e).lower(): return
-            try: await bot.delete_message(chat_id=user_id, message_id=data["msg_id"])
-            except Exception: pass
+            data["msg_id"] = None
+        except Exception:
+            data["msg_id"] = None
     
     msg = await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
     data["msg_id"] = msg.message_id
@@ -422,27 +420,25 @@ async def edit_or_send(user_id, text, reply_markup=None, parse_mode=None):
 async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     data = get_user_state(user_id)
+    now = time.time()
     
-    data["state"] = "START"
+    cfg = await get_db_config(user_id, username=message.from_user.username, first_name=message.from_user.first_name)
+    has_pin = bool(cfg.get("menu_lock_code"))
+    last_active = data.get("last_interaction_time", now)
     
-    if data.get("msg_id"):
-        try:
-            await bot.delete_message(chat_id=user_id, message_id=data["msg_id"])
-        except Exception:
-            pass
-        data["msg_id"] = None
+    if has_pin and (data.get("state") == "WAITING_UNLOCK_CODE" or (now - last_active >= 300)):
+        data["state"] = "WAITING_UNLOCK_CODE"
+        await edit_or_send(user_id, LANG["msg_unlock_req"])
+        return
 
-    asyncio.create_task(delayed_delete(message, 5))
+    data["state"] = "START"
     
     try:
         await update_daily_stats('incoming')
     except Exception:
         pass
 
-    cfg = await get_db_config(user_id, username=message.from_user.username, first_name=message.from_user.first_name)
-    
     if await ensure_client_connected(user_id):
-        if cfg.get("is_menu_locked") and data["state"] == "WAITING_UNLOCK_CODE": return
         await show_main_menu(user_id, message.from_user.username)
     else:
         builder = InlineKeyboardBuilder()
@@ -486,7 +482,6 @@ async def cancel_auth(cb: types.CallbackQuery):
 async def process_phone(message: types.Message):
     user_id = message.from_user.id
     phone = message.text.strip().replace(" ", "")
-    asyncio.create_task(delayed_delete(message, 5))
     
     if not phone.startswith("+"): phone = "+" + phone
     phone = re.sub(r'[^\d+]', '', phone)
@@ -511,7 +506,6 @@ async def process_phone(message: types.Message):
 async def process_code(message: types.Message):
     user_id = message.from_user.id
     code = re.sub(r'\D', '', message.text.strip())
-    asyncio.create_task(delayed_delete(message, 5))
     
     data = get_user_state(user_id)
     client = data["client"]
@@ -531,7 +525,6 @@ async def process_code(message: types.Message):
 async def process_password(message: types.Message):
     user_id = message.from_user.id
     pwd = message.text.strip()
-    asyncio.create_task(delayed_delete(message, 5))
     
     client = get_user_state(user_id)["client"]
     try:
@@ -539,9 +532,7 @@ async def process_password(message: types.Message):
         await finish_login(user_id, client)
     except Exception:
         msg_err = await message.answer("❌ Неверный пароль!")
-        await asyncio.sleep(3)
-        try: await msg_err.delete()
-        except: pass
+        asyncio.create_task(delayed_delete(msg_err, 3))
 
 async def finish_login(user_id, client):
     session_str = await client.export_session_string()
@@ -773,7 +764,6 @@ async def setup_autoresp_text(cb: types.CallbackQuery):
 async def process_autoresp_text(message: types.Message):
     user_id = message.from_user.id
     text = message.text.strip()
-    asyncio.create_task(delayed_delete(message, 5))
     
     await update_db_config(user_id, {"autoresponder_greeting": text})
     get_user_state(user_id)["state"] = "MENU"
@@ -837,17 +827,28 @@ async def process_del(cb: types.CallbackQuery):
 async def menu_block_settings(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     cfg = await get_db_config(user_id)
-    is_locked = cfg.get("is_menu_locked", False)
+    has_pin = bool(cfg.get("menu_lock_code"))
     
-    text = f"🔒 **Блокировка меню (PIN)**\n\nТекущий статус: {LANG['status_on'] if is_locked else LANG['status_off']}"
+    text = f"🔒 **Блокировка меню (PIN)**\n\nТекущий статус: {LANG['status_on'] if has_pin else LANG['status_off']}"
     builder = InlineKeyboardBuilder()
-    if is_locked:
+    if has_pin:
+        builder.button(text=LANG["btn_lock_now"], callback_data="lock_now")
         builder.button(text="Снять блокировку 🔓", callback_data="disable_block")
     else:
         builder.button(text="Установить PIN-код 🔐", callback_data="setup_block_pin")
     builder.button(text=LANG["btn_back_menu"], callback_data="main_menu")
     builder.adjust(1)
     await edit_or_send(user_id, text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+@dp.callback_query(F.data == "lock_now")
+async def lock_now(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    cfg = await get_db_config(user_id)
+    if cfg.get("menu_lock_code"):
+        get_user_state(user_id)["state"] = "WAITING_UNLOCK_CODE"
+        await edit_or_send(user_id, LANG["msg_unlock_req"])
+    else:
+        await cb.answer("❌ PIN-код не установлен!", show_alert=True)
 
 @dp.callback_query(F.data == "setup_block_pin")
 async def setup_block_pin(cb: types.CallbackQuery):
@@ -860,7 +861,6 @@ async def setup_block_pin(cb: types.CallbackQuery):
 async def process_set_pin(message: types.Message):
     user_id = message.from_user.id
     pin = message.text.strip()
-    asyncio.create_task(delayed_delete(message, 5))
     
     if len(pin) == 4 and pin.isdigit():
         await update_db_config(user_id, {"is_menu_locked": True, "menu_lock_code": pin})
@@ -869,21 +869,19 @@ async def process_set_pin(message: types.Message):
         await edit_or_send(user_id, "✅ PIN-код успешно сохранен и меню заблокировано!", reply_markup=builder.as_markup())
     else:
         msg_err = await message.answer("❌ PIN-код должен состоять ровно из 4 цифр!")
-        await asyncio.sleep(3)
-        try: await msg_err.delete()
-        except: pass
+        asyncio.create_task(delayed_delete(msg_err, 3))
 
 @dp.callback_query(F.data == "disable_block")
 async def disable_block(cb: types.CallbackQuery):
     user_id = cb.from_user.id
     await update_db_config(user_id, {"is_menu_locked": False, "menu_lock_code": None})
+    get_user_state(user_id)["state"] = "MENU"
     await menu_block_settings(cb)
 
 @dp.message(lambda msg: get_user_state(msg.from_user.id)["state"] == "WAITING_UNLOCK_CODE")
 async def process_unlock_pin(message: types.Message):
     user_id = message.from_user.id
     pin = message.text.strip()
-    asyncio.create_task(delayed_delete(message, 5))
     
     cfg = await get_db_config(user_id)
     if pin == cfg.get("menu_lock_code"):
@@ -891,10 +889,9 @@ async def process_unlock_pin(message: types.Message):
         await update_db_config(user_id, {"last_interaction_time": time.time()})
         await show_main_menu(user_id, message.from_user.username)
     else:
+        await edit_or_send(user_id, LANG["msg_unlock_req"])
         msg_err = await message.answer("❌ Неверный PIN-код!")
-        await asyncio.sleep(3)
-        try: await msg_err.delete()
-        except: pass
+        asyncio.create_task(delayed_delete(msg_err, 3))
 
 @dp.callback_query(F.data == "admin_menu")
 async def admin_menu(cb: types.CallbackQuery):
@@ -1048,7 +1045,6 @@ async def admin_find_user(cb: types.CallbackQuery):
 async def process_find_user(message: types.Message):
     admin_id = message.from_user.id
     if not is_admin(admin_id, message.from_user.username): return
-    asyncio.create_task(delayed_delete(message, 5))
     
     try:
         target_id = int(message.text.strip())
@@ -1057,9 +1053,7 @@ async def process_find_user(message: types.Message):
         await admin_view_user(cb_dummy)
     except ValueError:
         msg_err = await message.answer("❌ ID должен быть числом!")
-        await asyncio.sleep(3)
-        try: await msg_err.delete()
-        except: pass
+        asyncio.create_task(delayed_delete(msg_err, 3))
 
 @dp.callback_query(F.data == "admin_grant")
 async def admin_grant(cb: types.CallbackQuery):
@@ -1072,7 +1066,6 @@ async def admin_grant(cb: types.CallbackQuery):
 async def process_grant_admin(message: types.Message):
     admin_id = message.from_user.id
     if not is_admin(admin_id, message.from_user.username): return
-    asyncio.create_task(delayed_delete(message, 5))
     
     try:
         target_id = int(message.text.strip())
@@ -1082,9 +1075,7 @@ async def process_grant_admin(message: types.Message):
         await edit_or_send(admin_id, f"✅ Юзеру {target_id} временно выданы права администратора!", reply_markup=builder.as_markup())
     except ValueError:
         msg_err = await message.answer("❌ ID должен быть числом!")
-        await asyncio.sleep(3)
-        try: await msg_err.delete()
-        except: pass
+        asyncio.create_task(delayed_delete(msg_err, 3))
 
 async def handle_ping(request):
     return web.Response(text="OK")
