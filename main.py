@@ -1,289 +1,310 @@
-import os
 import asyncio
-import secrets
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.exceptions import TelegramBadRequest
-from pyrogram import Client
-from pyrogram.errors import PhoneCodeInvalid, PhoneCodeExpired, SessionPasswordNeeded
+import os
+import re
+import random
+import string
+from dotenv import load_dotenv
+
 from supabase import create_client, Client as SupabaseClient
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
+from aiogram.filters import CommandStart
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
-# --- Конфигурация ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "ТВОЙ_ТОКЕН")
+from pyrogram import Client
+from pyrogram.errors import SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 API_ID = int(os.getenv("API_ID", "0") or 0)
-API_HASH = os.getenv("API_HASH", "ТВОЙ_ХЭШ")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "ТВОЙ_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "ТВОЙ_KEY")
-
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
-router = Router()
-dp.include_router(router)
+API_HASH = os.getenv("API_HASH", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Временное хранилище MTProto клиентов для авторизации (tg_id -> client)
-auth_clients = {}
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
 
-# --- FSM Состояния ---
-class AuthState(StatesGroup):
-    lang = State()
-    phone = State()
-    code = State()
-
-# --- Словари языков ---
-TEXTS = {
-    "ru": {
+# Локализация
+LANG_DICT = {
+    "RU": {
         "welcome": "Добро пожаловать в Qwitty registrator bot",
         "btn_start": "Начать",
         "btn_back": "Назад",
-        "enter_phone": "Введите номер для входа в Qwitty user bot, например +79123456789.",
-        "code_sent": "На {phone} отправлен код, вводите код с пробелами! Например 12 3 45.",
-        "code_error": "Код введен неверно, пожалуйста, введите заново.",
-        "success": "Аккаунт Qwitty User bot успешно подключен!\n\nВаш ID код: `{qwt_id}`\nНикому не передавайте ID код, ваша безопасность важна для нас!",
-        "already_auth": "Вы уже авторизованы. Ваш ID: `{qwt_id}`"
+        "phone_req": "Для входа в Qwitty user bot введите номер, например +79991234567.",
+        "code_req": "На номер {phone} отправлен код, вводите код с пробелами! Например 12 3 45.",
+        "code_err": "Код введен неверно, пожалуйста, введите заново.",
+        "success": "Аккаунт Qwitty User bot подключен!\n\nВаш ID код: `{qwitty_id}`\nНикому не передавайте ID код, ваша безопасность важна для нас!"
     },
-    "en": {
+    "ENG": {
         "welcome": "Welcome to Qwitty registrator bot",
         "btn_start": "Start",
         "btn_back": "Back",
-        "enter_phone": "Enter your number to log into Qwitty user bot, e.g. +123456789.",
-        "code_sent": "Code sent to {phone}. Please write it with spaces! E.g. 12 3 45.",
-        "code_error": "Invalid code, please try again.",
-        "success": "Qwitty User bot account connected!\n\nYour ID code: `{qwt_id}`\nDo not share your ID code with anyone, your safety is important to us!",
-        "already_auth": "You are already authorized. Your ID: `{qwt_id}`"
+        "phone_req": "To log into Qwitty user bot, enter your number, e.g., +1234567890.",
+        "code_req": "Code sent to {phone}, please write the code with spaces! E.g., 12 3 45.",
+        "code_err": "Invalid code, please enter again.",
+        "success": "Qwitty User bot account connected!\n\nYour ID code: `{qwitty_id}`\nDo not share your ID code with anyone, your safety is important to us!"
     },
-    "uz": {
-        "welcome": "Qwitty registrator botiga xush kelibsiz",
+    "UZB": {
+        "welcome": "Qwitty registrator botga xush kelibsiz",
         "btn_start": "Boshlash",
         "btn_back": "Orqaga",
-        "enter_phone": "Qwitty user bot kiritish uchun nomer yozing, masalan +998991234567.",
-        "code_sent": "{phone} ga kod yuborildi, kod bo'sh o'rinlar bilan yozilsin! Masalan 12 3 45.",
-        "code_error": "Kod xato yozilgan, iltimos qaytadan kiriting.",
-        "success": "Qwitty User bot akkauntga ulandi!\n\nSizning ID kodingiz: `{qwt_id}`\nID kodni hech kimga bermang, sizning xavfsizligingiz biz uchun muhim!",
-        "already_auth": "Siz allaqachon ro'yxatdan o'tgansiz. Sizning ID: `{qwt_id}`"
+        "phone_req": "Qwitty user bot kiritish uchun nomer yozing, masalan +998991234567.",
+        "code_req": "{phone} ga kod yuborildi, kod bo'sh o'rinlar bilan yozilsin! Masalan 12 3 45.",
+        "code_err": "Kod xato yozilgan, iltimos qaytadan kiriting.",
+        "success": "Qwitty User bot akkauntga ulandi!\n\nSizning ID kodingiz: `{qwitty_id}`\nID kodni hech kimga bermang, sizning xavfsizligingiz biz uchun muhim!"
     },
-    "kz": {
-        "welcome": "Qwitty registrator botқа қош келдіңіз",
+    "KZ": {
+        "welcome": "Qwitty тіркеу ботына қош келдіңіз",
         "btn_start": "Бастау",
         "btn_back": "Артқа",
-        "enter_phone": "Qwitty user bot-қа кіру үшін нөміріңізді жазыңыз, мысалы +7123456789.",
-        "code_sent": "Код {phone}-ға жіберілді, кодты бос орындармен жазыңыз! Мысалы 12 3 45.",
-        "code_error": "Код қате, қайтадан енгізіңіз.",
-        "success": "Qwitty User bot аккаунты қосылды!\n\nСіздің ID кодыңыз: `{qwt_id}`\nID кодты ешкімге бермеңіз, сіздің қауіпсіздігіңіз біз үшін маңызды!",
-        "already_auth": "Сіз тіркелгенсіз. Сіздің ID: `{qwt_id}`"
+        "phone_req": "Qwitty user bot-қа кіру үшін нөміріңізді жазыңыз, мысалы +77011234567.",
+        "code_req": "{phone} нөміріне код жіберілді, кодты бос орындармен жазыңыз! Мысалы 12 3 45.",
+        "code_err": "Код қате жазылған, қайта енгізіңіз.",
+        "success": "Qwitty User bot аккаунты қосылды!\n\nСіздің ID кодыңыз: `{qwitty_id}`\nID кодты ешкімге бермеңіз, сіздің қауіпсіздігіңіз біз үшін маңызды!"
     }
 }
 
-# --- Вспомогательные функции ---
-def get_lang_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🇷🇺 RU", callback_data="lang_ru"),
-            InlineKeyboardButton(text="🇬🇧 ENG", callback_data="lang_en")
-        ],
-        [
-            InlineKeyboardButton(text="🇺🇿 UZB", callback_data="lang_uz"),
-            InlineKeyboardButton(text="🇰🇿 KZ", callback_data="lang_kz")
-        ]
-    ])
+# Хранилище состояний пользователей
+USER_DATA = {}
 
-def get_start_kb(lang):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=TEXTS[lang]["btn_start"], callback_data="action_start")],
-        [InlineKeyboardButton(text=TEXTS[lang]["btn_back"], callback_data="action_back_lang")]
-    ])
-
-def get_back_kb(lang):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=TEXTS[lang]["btn_back"], callback_data="action_back_start")]
-    ])
-
-async def delayed_delete(message: Message, delay: int = 3):
-    """Удаляет сообщение через заданное время."""
-    await asyncio.sleep(delay)
-    try:
-        await message.delete()
-    except TelegramBadRequest:
-        pass
-
-# --- Хэндлеры ---
-
-@router.message(F.text == "/start")
-async def cmd_start(message: Message, state: FSMContext):
-    # Удаляем /start через 3 секунды
-    asyncio.create_task(delayed_delete(message, 3))
-    
-    user_id = message.from_user.id
-    
-    # Проверка сессии в Supabase
-    res = supabase.table("qwitty_users").select("*").eq("tg_id", user_id).execute()
-    if res.data:
-        lang = res.data[0].get("lang", "ru")
-        qwt_id = res.data[0].get("qwt_id")
-        msg = await message.answer(TEXTS[lang]["already_auth"].format(qwt_id=qwt_id), parse_mode="Markdown")
-        # Удаляем сообщение бота тоже через время? Оставим висеть или можно добавить таск
-        return
-
-    await state.clear()
-    await message.answer("🇷🇺 Выберите язык / 🇬🇧 Choose language / 🇺🇿 Tilni tanlang / 🇰🇿 Тілді таңдаңыз:", reply_markup=get_lang_kb())
-
-@router.callback_query(F.data.startswith("lang_"))
-async def process_language(callback: CallbackQuery, state: FSMContext):
-    lang = callback.data.split("_")[1]
-    await state.update_data(lang=lang)
-    
-    text = TEXTS[lang]["welcome"]
-    await callback.message.edit_text(text, reply_markup=get_start_kb(lang))
-
-@router.callback_query(F.data == "action_back_lang")
-async def process_back_lang(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("🇷🇺 Выберите язык / 🇬🇧 Choose language / 🇺🇿 Tilni tanlang / 🇰🇿 Тілді таңдаңыз:", reply_markup=get_lang_kb())
-
-@router.callback_query(F.data == "action_start")
-async def process_action_start(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    lang = data.get("lang", "ru")
-    
-    await state.set_state(AuthState.phone)
-    await callback.message.edit_text(TEXTS[lang]["enter_phone"], reply_markup=get_back_kb(lang))
-
-@router.callback_query(F.data == "action_back_start")
-async def process_back_start(callback: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    lang = data.get("lang", "ru")
-    await state.set_state(AuthState.lang)
-    await callback.message.edit_text(TEXTS[lang]["welcome"], reply_markup=get_start_kb(lang))
-
-@router.message(AuthState.phone)
-async def process_phone(message: Message, state: FSMContext):
-    # Удаляем сообщение пользователя с номером
-    try: await message.delete()
-    except: pass
-
-    data = await state.get_data()
-    lang = data.get("lang", "ru")
-    phone = message.text.strip().replace(" ", "").replace("+", "")
-    
-    # Находим сообщение с ботом, чтобы обновить инлайн (достаем из истории или просто отправляем новое, 
-    # но лучше перехватить предыдущее. Для простоты отправим новое и сохраним его ID)
-    
-    bot_msg = await message.answer("🔄 Processing...")
-    user_id = message.from_user.id
-    masked_phone = f"+{phone[:5]}*****"
-
-    try:
-        # Создаем MTProto клиент в памяти
-        client = Client(f"session_{user_id}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
-        await client.connect()
-        
-        sent_code = await client.send_code(phone)
-        
-        # Сохраняем клиента и хэш кода, чтобы использовать при проверке
-        auth_clients[user_id] = {
-            "client": client,
-            "phone_code_hash": sent_code.phone_code_hash,
-            "phone": phone
+def get_user_state(user_id):
+    if user_id not in USER_DATA:
+        USER_DATA[user_id] = {
+            "msg_id": None, "state": "START", "lang": "RU", 
+            "phone": None, "phone_code_hash": None, "client": None
         }
-        
-        await state.update_data(bot_msg_id=bot_msg.message_id)
-        await state.set_state(AuthState.code)
-        await bot_msg.edit_text(TEXTS[lang]["code_sent"].format(phone=masked_phone), reply_markup=get_back_kb(lang))
+    return USER_DATA[user_id]
 
-    except Exception as e:
-        await bot_msg.edit_text(f"Error: {str(e)}", reply_markup=get_back_kb(lang))
+# Утилиты БД
+def get_user_db(user_id):
+    res = supabase.table("qwitty_users").select("*").eq("user_id", user_id).execute()
+    return res.data[0] if res.data else None
 
-@router.message(AuthState.code)
-async def process_code(message: Message, state: FSMContext):
-    # Всегда удаляем сообщение пользователя
-    try: await message.delete()
-    except: pass
+def generate_qwitty_id():
+    chars = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    return f"Qwt-{chars}"
 
-    data = await state.get_data()
-    lang = data.get("lang", "ru")
-    bot_msg_id = data.get("bot_msg_id")
-    user_id = message.from_user.id
-    
-    # Код формата "12 3 45" убираем пробелы
-    code = message.text.replace(" ", "").strip()
-    
-    auth_data = auth_clients.get(user_id)
-    if not auth_data:
-        # Сессия сбросилась
-        await bot.edit_message_text(chat_id=user_id, message_id=bot_msg_id, text="Session expired. /start")
-        return
+def save_user_db(user_id, lang, phone, session_string, qwitty_id):
+    supabase.table("qwitty_users").upsert({
+        "user_id": user_id,
+        "qwitty_id": qwitty_id,
+        "lang": lang,
+        "phone": phone,
+        "session_string": session_string
+    }).execute()
 
-    client: Client = auth_data["client"]
-    phone_code_hash = auth_data["phone_code_hash"]
-    phone = auth_data["phone"]
+# Редактор сообщений
+async def edit_or_send(user_id, text, reply_markup=None, parse_mode="Markdown"):
+    data = get_user_state(user_id)
+    if data["msg_id"]:
+        try:
+            await bot.edit_message_text(chat_id=user_id, message_id=data["msg_id"], text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+        except TelegramBadRequest as e:
+            if "not modified" in str(e).lower(): return
+            data["msg_id"] = None
+        except Exception:
+            data["msg_id"] = None
+            
+    msg = await bot.send_message(chat_id=user_id, text=text, reply_markup=reply_markup, parse_mode=parse_mode)
+    data["msg_id"] = msg.message_id
 
-    try:
-        await client.sign_in(phone, phone_code_hash, code)
-        
-        # Успешная авторизация
-        session_string = await client.export_session_string()
-        await client.disconnect()
-        del auth_clients[user_id]
-        
-        # Генерируем Qwt ID
-        qwt_id = f"Qwt-{secrets.token_hex(4).upper()}"
-        
-        # Записываем в Supabase
-        supabase.table("qwitty_users").insert({
-            "tg_id": user_id,
-            "lang": lang,
-            "phone": phone,
-            "session_string": session_string,
-            "qwt_id": qwt_id
-        }).execute()
-
-        await state.clear()
-        
-        # Обновляем сообщение успехом (ID можно будет скопировать по клику благодаря Markdown)
-        await bot.edit_message_text(
-            chat_id=user_id, 
-            message_id=bot_msg_id, 
-            text=TEXTS[lang]["success"].format(qwt_id=qwt_id), 
-            parse_mode="Markdown"
-        )
-
-    except (PhoneCodeInvalid, PhoneCodeExpired):
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=bot_msg_id,
-            text=TEXTS[lang]["code_error"],
-            reply_markup=get_back_kb(lang)
-        )
-    except SessionPasswordNeeded:
-        # Если включена двухфакторка (2FA) - можно добавить обработку по необходимости
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=bot_msg_id,
-            text="2FA Password Required (Not implemented in this snippet)",
-            reply_markup=get_back_kb(lang)
-        )
-    except Exception as e:
-        await bot.edit_message_text(
-            chat_id=user_id,
-            message_id=bot_msg_id,
-            text=f"Error: {e}",
-            reply_markup=get_back_kb(lang)
-        )
-
-# Глобальный перехватчик, чтобы удалять ЛЮБОЕ левое сообщение во время регистрации
-@router.message()
-async def delete_unwanted_messages(message: Message):
+# Мидлварь для удаления сообщений (и задержка 3 сек для /start)
+async def delayed_delete(message: types.Message, delay: int):
+    if delay > 0:
+        await asyncio.sleep(delay)
     try:
         await message.delete()
-    except TelegramBadRequest:
+    except Exception:
         pass
+
+class DeleteMessageMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, types.Message):
+            if event.text == "/start":
+                asyncio.create_task(delayed_delete(event, 3))
+            else:
+                asyncio.create_task(delayed_delete(event, 0))
+        return await handler(event, data)
+
+dp.update.middleware(DeleteMessageMiddleware())
+
+# Обработчик /start
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    db_user = get_user_db(user_id)
+    
+    if db_user:
+        # Сессия уже есть, показываем главное меню (успех)
+        lang = db_user["lang"]
+        qwitty_id = db_user["qwitty_id"]
+        text = LANG_DICT[lang]["success"].format(qwitty_id=qwitty_id)
+        get_user_state(user_id)["state"] = "REGISTERED"
+        await edit_or_send(user_id, text)
+    else:
+        # Сессии нет, показываем выбор языка
+        get_user_state(user_id)["state"] = "SELECT_LANG"
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🇷🇺 RU", callback_data="lang_RU")
+        builder.button(text="🇬🇧 ENG", callback_data="lang_ENG")
+        builder.button(text="🇺🇿 UZB", callback_data="lang_UZB")
+        builder.button(text="🇰🇿 KZ", callback_data="lang_KZ")
+        builder.adjust(2, 2)
+        
+        await edit_or_send(user_id, "Выберите язык / Choose language / Tilni tanlang / Тілді таңдаңыз:", reply_markup=builder.as_markup())
+
+# Выбор языка
+@dp.callback_query(F.data.startswith("lang_"))
+async def select_language(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    lang = cb.data.split("_")[1]
+    
+    data = get_user_state(user_id)
+    data["lang"] = lang
+    data["state"] = "START_AUTH"
+    
+    await show_welcome_menu(user_id)
+
+async def show_welcome_menu(user_id):
+    data = get_user_state(user_id)
+    lang = data["lang"]
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text=LANG_DICT[lang]["btn_start"], callback_data="auth_start")
+    builder.button(text=LANG_DICT[lang]["btn_back"], callback_data="back_to_lang")
+    builder.adjust(1)
+    
+    await edit_or_send(user_id, LANG_DICT[lang]["welcome"], reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "back_to_lang")
+async def back_to_lang(cb: types.CallbackQuery):
+    # Возврат к выбору языка, имитируем новый старт
+    class MockMessage:
+        def __init__(self, user_id):
+            self.from_user = type("User", (), {"id": user_id})()
+    await cmd_start(MockMessage(cb.from_user.id))
+
+@dp.callback_query(F.data == "auth_start")
+async def auth_start(cb: types.CallbackQuery):
+    user_id = cb.from_user.id
+    data = get_user_state(user_id)
+    lang = data["lang"]
+    data["state"] = "WAITING_PHONE"
+    
+    builder = InlineKeyboardBuilder().button(text=LANG_DICT[lang]["btn_back"], callback_data="cancel_auth")
+    await edit_or_send(user_id, LANG_DICT[lang]["phone_req"], reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "cancel_auth")
+async def cancel_auth(cb: types.CallbackQuery):
+    data = get_user_state(cb.from_user.id)
+    if data["client"]:
+        try: await data["client"].disconnect()
+        except: pass
+        data["client"] = None
+    await show_welcome_menu(cb.from_user.id)
+
+# Ожидание номера
+@dp.message(lambda msg: get_user_state(msg.from_user.id)["state"] == "WAITING_PHONE")
+async def process_phone(message: types.Message):
+    user_id = message.from_user.id
+    data = get_user_state(user_id)
+    lang = data["lang"]
+    
+    phone = message.text.strip().replace(" ", "")
+    if not phone.startswith("+"): phone = "+" + phone
+    phone = re.sub(r'[^\d+]', '', phone)
+    
+    data["phone"] = phone
+    
+    # Создаем in-memory клиент Pyrogram
+    client = Client(f"qwitty_{user_id}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    data["client"] = client
+    
+    try:
+        await client.connect()
+        code_info = await client.send_code(phone)
+        data["phone_code_hash"] = code_info.phone_code_hash
+        data["state"] = "WAITING_CODE"
+        
+        masked_phone = phone[:6] + "*****"
+        text = LANG_DICT[lang]["code_req"].format(phone=masked_phone)
+        builder = InlineKeyboardBuilder().button(text=LANG_DICT[lang]["btn_back"], callback_data="cancel_auth")
+        
+        await edit_or_send(user_id, text, reply_markup=builder.as_markup())
+    except Exception as e:
+        await edit_or_send(user_id, f"Ошибка / Xato: {e}")
+
+# Ожидание кода
+@dp.message(lambda msg: get_user_state(msg.from_user.id)["state"] == "WAITING_CODE")
+async def process_code(message: types.Message):
+    user_id = message.from_user.id
+    data = get_user_state(user_id)
+    lang = data["lang"]
+    client = data["client"]
+    
+    if not client: return
+    
+    # Убираем пробелы, так как пользователи пишут "12 3 45"
+    code = message.text.replace(" ", "")
+    
+    try:
+        await client.sign_in(data["phone"], data["phone_code_hash"], code)
+        await finalize_auth(user_id, client)
+    except (PhoneCodeInvalid, PhoneCodeExpired):
+        builder = InlineKeyboardBuilder().button(text=LANG_DICT[lang]["btn_back"], callback_data="cancel_auth")
+        await edit_or_send(user_id, LANG_DICT[lang]["code_err"], reply_markup=builder.as_markup())
+    except SessionPasswordNeeded:
+        data["state"] = "WAITING_PASSWORD"
+        builder = InlineKeyboardBuilder().button(text=LANG_DICT[lang]["btn_back"], callback_data="cancel_auth")
+        await edit_or_send(user_id, "Аккаунт защищен 2FA паролем. Введите его в чат:", reply_markup=builder.as_markup())
+    except Exception as e:
+        await edit_or_send(user_id, f"Ошибка / Xato: {e}")
+
+# Ожидание 2FA пароля
+@dp.message(lambda msg: get_user_state(msg.from_user.id)["state"] == "WAITING_PASSWORD")
+async def process_password(message: types.Message):
+    user_id = message.from_user.id
+    data = get_user_state(user_id)
+    client = data["client"]
+    pwd = message.text.strip()
+    
+    try:
+        await client.check_password(pwd)
+        await finalize_auth(user_id, client)
+    except Exception:
+        lang = data["lang"]
+        builder = InlineKeyboardBuilder().button(text=LANG_DICT[lang]["btn_back"], callback_data="cancel_auth")
+        await edit_or_send(user_id, "❌ Неверный пароль / Noto'g'ri parol!", reply_markup=builder.as_markup())
+
+async def finalize_auth(user_id, client):
+    data = get_user_state(user_id)
+    lang = data["lang"]
+    
+    session_string = await client.export_session_string()
+    qwitty_id = generate_qwitty_id()
+    
+    save_user_db(
+        user_id=user_id, 
+        lang=lang, 
+        phone=data["phone"], 
+        session_string=session_string, 
+        qwitty_id=qwitty_id
+    )
+    
+    data["state"] = "REGISTERED"
+    try: await client.disconnect()
+    except: pass
+    data["client"] = None
+    
+    text = LANG_DICT[lang]["success"].format(qwitty_id=qwitty_id)
+    await edit_or_send(user_id, text)
 
 
 async def main():
-    print("Bot is starting...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
